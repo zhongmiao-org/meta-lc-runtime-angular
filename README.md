@@ -27,11 +27,34 @@ Angular runtime integration layer for schema rendering/data binding through BFF-
 ## Quick Start
 
 after cloning this repo:
-
-
+```bash
+npm ci
+npm run build
+npm run test -- --watch=false
+```
 
 after adding implementation packages:
+```ts
+import { provideHttpClient } from '@angular/common/http';
+import { NGX_LOWCODE_DATASOURCE_MANAGER, NGX_LOWCODE_WEBSOCKET_MANAGER } from '@zhongmiao/ngx-lowcode-core-types';
+import { createBffDataSourceManager, createDefaultWebSocketManager } from '@zhongmiao/meta-lc-runtime-angular';
 
+export const appConfig = {
+  providers: [
+    provideHttpClient(),
+    {
+      provide: NGX_LOWCODE_DATASOURCE_MANAGER,
+      useValue: createBffDataSourceManager({
+        baseUrl: 'http://localhost:6000'
+      })
+    },
+    {
+      provide: NGX_LOWCODE_WEBSOCKET_MANAGER,
+      useValue: createDefaultWebSocketManager()
+    }
+  ]
+};
+```
 
 
 ## References
