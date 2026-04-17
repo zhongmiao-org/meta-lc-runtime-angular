@@ -1,0 +1,122 @@
+name: Publish Runtime Adapter
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: "npm dist-tag"
+        required: true
+        default: "latest"
+        type: choice
+        options:
+          - latest
+          - next
+
+permissions:
+  contents: write
+
+concurrency:
+  group: runtime-angular-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build
+
+      - name: Resolve package metadata
+        id: meta
+        run: |
+          NAME="$(node -p "require('./projects/runtime-adapter/package.json').name")"
+          VERSION="$(node -p "require('./projects/runtime-adapter/package.json').version")"
+          TAG="v${VERSION}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure version is not already published
+        run: |
+          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version --registry https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "Version already published: ${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}"
+            echo "Please bump projects/runtime-adapter/package.json version and rerun release."
+            exit 1
+          fi
+
+      - name: Configure npm auth
+        run: |
+          if [[ -z "${NODE_AUTH_TOKEN}" ]]; then
+            echo "NPM_TOKEN is not configured."
+            exit 1
+          fi
+          cat > ~/.npmrc <<EOF
+          //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+          EOF
+
+      - name: Publish package
+        run: |
+          npm publish ./dist/runtime-adapter --access public --tag "${{ github.event.inputs.dist_tag }}"
+
+      - name: Upsert GitHub release
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const tag = '${{ steps.meta.outputs.tag }}';
+            const name = '${{ steps.meta.outputs.name }}';
+            const version = '${{ steps.meta.outputs.version }}';
+            const distTag = '${{ github.event.inputs.dist_tag }}';
+            const body = [
+              `Published ${name}@${version}`,
+              '',
+              `- npm dist-tag: ${distTag}`,
+              `- package path: dist/runtime-adapter`
+            ].join('\n');
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            const existing = releases.find((r) => r.tag_name === tag);
+
+            if (existing) {
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existing.id,
+                draft: false,
+                prerelease: distTag === 'next',
+                name: tag,
+                body
+              });
+              core.info(`Updated release ${tag}`);
+            } else {
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                target_commitish: context.sha,
+                name: tag,
+                draft: false,
+                prerelease: distTag === 'next',
+                body
+              });
+              core.info(`Created release ${tag}`);
+            }
