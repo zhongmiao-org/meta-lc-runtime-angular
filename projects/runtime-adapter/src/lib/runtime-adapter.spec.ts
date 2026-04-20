@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createBffDataSourceManager,
   createDefaultWebSocketManager,
-  RuntimeBffExecutionSnapshot
+  createSocketIoWebSocketManager,
+  parseRuntimePageTopic,
+  RuntimeSocketLike,
+  RuntimeBffExecutionSnapshot,
 } from './runtime-adapter';
 
 function createDatasource(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -16,11 +19,11 @@ function createDatasource(overrides: Record<string, unknown> = {}): Record<strin
         stateKeys: {
           tenantId: 'tenantId',
           userId: 'userId',
-          roles: 'roles'
-        }
-      }
+          roles: 'roles',
+        },
+      },
     },
-    ...overrides
+    ...overrides,
   };
 }
 
@@ -30,15 +33,15 @@ describe('createBffDataSourceManager', () => {
       new Response(JSON.stringify({ rows: [{ id: 'o-1' }] }), {
         status: 200,
         headers: {
-          'x-request-id': 'server-1'
-        }
-      })
+          'x-request-id': 'server-1',
+        },
+      }),
     );
     const executions: RuntimeBffExecutionSnapshot[] = [];
     const manager = createBffDataSourceManager({
       baseUrl: 'http://localhost:6000',
       fetchImpl: fetchSpy,
-      onExecution: (snapshot) => executions.push(snapshot)
+      onExecution: (snapshot) => executions.push(snapshot),
     });
 
     const result = await manager.execute({
@@ -47,8 +50,8 @@ describe('createBffDataSourceManager', () => {
         tenantId: 'tenant-a',
         userId: 'u-a',
         roles: ['MANAGER'],
-        filter_keyword: 'hello'
-      }
+        filter_keyword: 'hello',
+      },
     });
 
     expect(fetchSpy).toHaveBeenCalledOnce();
@@ -70,12 +73,12 @@ describe('createBffDataSourceManager', () => {
       new Response(JSON.stringify({ rowCount: 1, row: { id: 'o-1' } }), {
         status: 200,
         headers: {
-          'x-request-id': 'server-mutation'
-        }
-      })
+          'x-request-id': 'server-mutation',
+        },
+      }),
     );
     const manager = createBffDataSourceManager({
-      fetchImpl: fetchSpy
+      fetchImpl: fetchSpy,
     });
 
     const result = await manager.execute({
@@ -87,18 +90,18 @@ describe('createBffDataSourceManager', () => {
             operation: 'create',
             fieldStateMap: {
               id: 'form_id',
-              org_id: 'form_org_id'
-            }
-          }
-        }
+              org_id: 'form_org_id',
+            },
+          },
+        },
       }) as never,
       state: {
         tenantId: 'tenant-a',
         userId: 'u-a',
         roles: ['USER'],
         form_id: 'o-1',
-        form_org_id: 'dept-a'
-      }
+        form_org_id: 'dept-a',
+      },
     });
 
     const [endpoint, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
@@ -112,20 +115,20 @@ describe('createBffDataSourceManager', () => {
   it('classifies 403 errors as denied', async () => {
     const fetchSpy = vi.fn().mockResolvedValue(
       new Response('permission denied', {
-        status: 403
-      })
+        status: 403,
+      }),
     );
     const executions: RuntimeBffExecutionSnapshot[] = [];
     const manager = createBffDataSourceManager({
       fetchImpl: fetchSpy,
-      onExecution: (snapshot) => executions.push(snapshot)
+      onExecution: (snapshot) => executions.push(snapshot),
     });
 
     await expect(
       manager.execute({
         datasource: createDatasource() as never,
-        state: {}
-      })
+        state: {},
+      }),
     ).rejects.toThrowError('permission denied');
 
     expect(executions[0]?.status).toBe('denied');
@@ -137,14 +140,14 @@ describe('createBffDataSourceManager', () => {
     const executions: RuntimeBffExecutionSnapshot[] = [];
     const manager = createBffDataSourceManager({
       fetchImpl: fetchSpy,
-      onExecution: (snapshot) => executions.push(snapshot)
+      onExecution: (snapshot) => executions.push(snapshot),
     });
 
     await expect(
       manager.execute({
         datasource: createDatasource() as never,
-        state: {}
-      })
+        state: {},
+      }),
     ).rejects.toThrowError('network down');
 
     expect(executions[0]?.status).toBe('network_error');
@@ -161,7 +164,7 @@ describe('createDefaultWebSocketManager', () => {
       onConnect,
       onDisconnect,
       onSubscribe,
-      onUnsubscribe
+      onUnsubscribe,
     });
     const handler = vi.fn();
 
@@ -176,3 +179,213 @@ describe('createDefaultWebSocketManager', () => {
     expect(onDisconnect).toHaveBeenCalledOnce();
   });
 });
+
+describe('createSocketIoWebSocketManager', () => {
+  it('parses runtime page topics and rejects invalid topics', () => {
+    expect(parseRuntimePageTopic('tenant.tenant-a.page.orders.instance.instance-1')).toEqual({
+      tenantId: 'tenant-a',
+      pageId: 'orders',
+      pageInstanceId: 'instance-1',
+    });
+
+    expect(() => parseRuntimePageTopic('orders')).toThrowError(
+      'Invalid runtime page topic: orders. Expected tenant.{tenantId}.page.{pageId}.instance.{pageInstanceId}.',
+    );
+  });
+
+  it('connects and disconnects the socket', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      baseUrl: 'http://localhost:6001',
+      socketFactory: () => socket,
+    });
+
+    await manager.connect();
+    await manager.disconnect();
+
+    expect(socket.connected).toBe(false);
+    expect(socket.connectCalls).toBe(1);
+    expect(socket.disconnectCalls).toBe(1);
+    expect(socket.listenerCount('runtimeManagerExecuted')).toBe(0);
+  });
+
+  it('subscribes to BFF runtime page topics without cursor', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      baseUrl: 'http://localhost:6001',
+      socketFactory: (url, options) => {
+        socket.createdWith = { url, options };
+        return socket;
+      },
+    });
+    const handler = vi.fn();
+
+    await manager.connect();
+    await manager.subscribe('tenant.tenant-a.page.orders.instance.instance-1', handler);
+
+    expect(socket.createdWith).toEqual({
+      url: 'http://localhost:6001/runtime',
+      options: { autoConnect: false },
+    });
+    expect(socket.emits).toEqual([
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+        },
+      },
+    ]);
+  });
+
+  it('subscribes with replay cursor options', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      baseUrl: 'http://localhost:6001',
+      namespace: 'runtime',
+      socketFactory: () => socket,
+    });
+
+    await subscribeWithOptions(
+      manager,
+      'tenant.tenant-a.page.orders.instance.instance-1',
+      vi.fn(),
+      {
+        afterReplayId: '42-0',
+      },
+    );
+
+    expect(socket.emits).toEqual([
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+          afterReplayId: '42-0',
+        },
+      },
+    ]);
+  });
+
+  it('dispatches manager events only to matching topic handlers', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+    const ordersHandler = vi.fn();
+    const customersHandler = vi.fn();
+    const update = {
+      type: 'runtime.manager.executed',
+      topic: 'tenant.tenant-a.page.orders.instance.instance-1',
+      page: {
+        tenantId: 'tenant-a',
+        pageId: 'orders',
+        pageInstanceId: 'instance-1',
+      },
+      patchState: {},
+      refreshedDatasourceIds: [],
+      runActionIds: [],
+    };
+
+    await manager.connect();
+    await manager.subscribe('tenant.tenant-a.page.orders.instance.instance-1', ordersHandler);
+    await manager.subscribe('tenant.tenant-a.page.customers.instance.instance-1', customersHandler);
+    socket.receive('runtimeManagerExecuted', update);
+
+    expect(ordersHandler).toHaveBeenCalledWith(update);
+    expect(customersHandler).not.toHaveBeenCalled();
+  });
+
+  it('stops dispatching after unsubscribe', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+    const handler = vi.fn();
+    const topic = 'tenant.tenant-a.page.orders.instance.instance-1';
+
+    await manager.connect();
+    await manager.subscribe(topic, handler);
+    await manager.unsubscribe(topic, handler);
+    socket.receive('runtimeManagerExecuted', {
+      type: 'runtime.manager.executed',
+      topic,
+      page: {
+        tenantId: 'tenant-a',
+        pageId: 'orders',
+        pageInstanceId: 'instance-1',
+      },
+      patchState: {},
+      refreshedDatasourceIds: [],
+      runActionIds: [],
+    });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+class FakeRuntimeSocket implements RuntimeSocketLike {
+  readonly emits: Array<{ event: string; payload: unknown }> = [];
+  readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
+  connectCalls = 0;
+  disconnectCalls = 0;
+  connected = false;
+  createdWith?: { url: string; options: unknown };
+
+  connect(): RuntimeSocketLike {
+    this.connectCalls += 1;
+    this.connected = true;
+    return this;
+  }
+
+  disconnect(): RuntimeSocketLike {
+    this.disconnectCalls += 1;
+    this.connected = false;
+    return this;
+  }
+
+  emit(event: string, payload: unknown): RuntimeSocketLike {
+    this.emits.push({ event, payload });
+    return this;
+  }
+
+  on(event: string, handler: (payload: unknown) => void): RuntimeSocketLike {
+    const handlers = this.listeners.get(event) ?? new Set<(payload: unknown) => void>();
+    handlers.add(handler);
+    this.listeners.set(event, handlers);
+    return this;
+  }
+
+  off(event: string, handler: (payload: unknown) => void): RuntimeSocketLike {
+    const handlers = this.listeners.get(event);
+    handlers?.delete(handler);
+    return this;
+  }
+
+  receive(event: string, payload: unknown): void {
+    for (const handler of this.listeners.get(event) ?? []) {
+      handler(payload);
+    }
+  }
+
+  listenerCount(event: string): number {
+    return this.listeners.get(event)?.size ?? 0;
+  }
+}
+
+async function subscribeWithOptions(
+  manager: ReturnType<typeof createSocketIoWebSocketManager>,
+  channel: string,
+  handler: (event: unknown) => void,
+  options: { afterReplayId: string },
+): Promise<void> {
+  await (
+    manager.subscribe as unknown as (
+      channel: string,
+      handler: (event: unknown) => void,
+      options: { afterReplayId: string },
+    ) => void | Promise<void>
+  )(channel, handler, options);
+}
