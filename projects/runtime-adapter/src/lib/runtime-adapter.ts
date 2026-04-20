@@ -3,8 +3,9 @@ import {
   NgxLowcodeDatasourceRequest,
   NgxLowcodeDataSourceManager,
   NgxLowcodeWebSocketEventHandler,
-  NgxLowcodeWebSocketManager
+  NgxLowcodeWebSocketManager,
 } from '@zhongmiao/ngx-lowcode-core-types';
+import { io, type ManagerOptions, type Socket, type SocketOptions } from 'socket.io-client';
 
 export interface RuntimeBffAdapterOptions {
   baseUrl?: string;
@@ -74,12 +75,18 @@ class RuntimeAdapterHttpError extends Error {
   }
 }
 
-export function createBffDataSourceManager(options: RuntimeBffAdapterOptions = {}): NgxLowcodeDataSourceManager {
+export function createBffDataSourceManager(
+  options: RuntimeBffAdapterOptions = {},
+): NgxLowcodeDataSourceManager {
   const fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
   const requestIdHeader = (options.requestIdHeader ?? 'x-request-id').toLowerCase();
 
   return {
-    execute: async ({ datasource, state, payload }: NgxLowcodeDatasourceRequest): Promise<unknown> => {
+    execute: async ({
+      datasource,
+      state,
+      payload,
+    }: NgxLowcodeDatasourceRequest): Promise<unknown> => {
       if (datasource.type === 'local-payload') {
         return extractPayloadField(payload, String(datasource.request?.params?.['field'] ?? 'id'));
       }
@@ -89,7 +96,12 @@ export function createBffDataSourceManager(options: RuntimeBffAdapterOptions = {
         const mutationPayload = toMutationPayload(datasource, state, mutationOperation, options);
         const endpoint = resolveEndpoint(options, datasource, 'mutation');
         const requestId = crypto.randomUUID();
-        const { json, responseRequestId } = await sendJsonRequest(fetchImpl, endpoint, requestId, mutationPayload);
+        const { json, responseRequestId } = await sendJsonRequest(
+          fetchImpl,
+          endpoint,
+          requestId,
+          mutationPayload,
+        );
 
         const response = asObject<MutationApiResponse>(json);
         recordExecution(options, {
@@ -97,7 +109,7 @@ export function createBffDataSourceManager(options: RuntimeBffAdapterOptions = {
           requestId,
           responseRequestId,
           status: 'success',
-          message: `${mutationOperation} succeeded`
+          message: `${mutationOperation} succeeded`,
         });
         return response.row ?? null;
       }
@@ -105,33 +117,38 @@ export function createBffDataSourceManager(options: RuntimeBffAdapterOptions = {
       const queryPayload = toQueryPayload(datasource, state, options);
       const endpoint = resolveEndpoint(options, datasource, 'query');
       const requestId = crypto.randomUUID();
-      const { json, responseRequestId } = await sendJsonRequest(fetchImpl, endpoint, requestId, queryPayload);
+      const { json, responseRequestId } = await sendJsonRequest(
+        fetchImpl,
+        endpoint,
+        requestId,
+        queryPayload,
+      );
       const rows = normalizeQueryRows(json);
       recordExecution(options, {
         endpoint,
         requestId,
         responseRequestId,
         status: 'success',
-        message: 'query succeeded'
+        message: 'query succeeded',
       });
       return rows;
-    }
+    },
   };
 
   async function sendJsonRequest(
     sender: typeof fetch,
     endpoint: string,
     requestId: string,
-    payload: QueryApiRequest | MutationApiRequest
+    payload: QueryApiRequest | MutationApiRequest,
   ): Promise<{ json: unknown; responseRequestId: string }> {
     try {
       const response = await sender(endpoint, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          [requestIdHeader]: requestId
+          [requestIdHeader]: requestId,
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
       });
 
       const responseRequestId = response.headers.get(requestIdHeader) ?? requestId;
@@ -145,14 +162,14 @@ export function createBffDataSourceManager(options: RuntimeBffAdapterOptions = {
           responseRequestId,
           status: response.status === 403 ? 'denied' : 'error',
           httpStatus: response.status,
-          message
+          message,
         });
         throw new RuntimeAdapterHttpError(response.status, message);
       }
 
       return {
         json: parsedJson,
-        responseRequestId
+        responseRequestId,
       };
     } catch (error) {
       if (error instanceof RuntimeAdapterHttpError) {
@@ -165,7 +182,7 @@ export function createBffDataSourceManager(options: RuntimeBffAdapterOptions = {
         requestId,
         responseRequestId: requestId,
         status: 'network_error',
-        message
+        message,
       });
       throw error;
     }
@@ -179,7 +196,48 @@ export interface WebSocketManagerOptions {
   onUnsubscribe?: (channel: string) => void | Promise<void>;
 }
 
-export function createDefaultWebSocketManager(options: WebSocketManagerOptions = {}): NgxLowcodeWebSocketManager {
+export interface RuntimePageTopicRef {
+  tenantId: string;
+  pageId: string;
+  pageInstanceId: string;
+}
+
+export interface RuntimeWebSocketSubscribeOptions {
+  afterReplayId?: string;
+}
+
+export interface RuntimeManagerExecutedEvent {
+  type: 'runtime.manager.executed';
+  topic: string;
+  page: RuntimePageTopicRef;
+  requestId?: string;
+  replayId?: string;
+  patchState: Record<string, unknown>;
+  refreshedDatasourceIds: string[];
+  runActionIds: string[];
+}
+
+export interface RuntimeSocketLike {
+  connect(): RuntimeSocketLike;
+  disconnect(): RuntimeSocketLike;
+  emit(event: string, payload: unknown): RuntimeSocketLike;
+  on(event: string, handler: (payload: unknown) => void): RuntimeSocketLike;
+  off(event: string, handler: (payload: unknown) => void): RuntimeSocketLike;
+}
+
+export interface SocketIoWebSocketManagerOptions {
+  baseUrl?: string;
+  namespace?: string;
+  socketOptions?: Partial<ManagerOptions & SocketOptions>;
+  socketFactory?: (
+    url: string,
+    options: Partial<ManagerOptions & SocketOptions>,
+  ) => RuntimeSocketLike;
+}
+
+export function createDefaultWebSocketManager(
+  options: WebSocketManagerOptions = {},
+): NgxLowcodeWebSocketManager {
   const subscriptions = new Map<string, Set<NgxLowcodeWebSocketEventHandler>>();
 
   return {
@@ -203,14 +261,102 @@ export function createDefaultWebSocketManager(options: WebSocketManagerOptions =
     disconnect: async () => {
       subscriptions.clear();
       await options.onDisconnect?.();
+    },
+  };
+}
+
+export function createSocketIoWebSocketManager(
+  options: SocketIoWebSocketManagerOptions = {},
+): NgxLowcodeWebSocketManager {
+  const subscriptions = new Map<string, Set<NgxLowcodeWebSocketEventHandler>>();
+  const socketUrl = resolveSocketUrl(options);
+  const socketOptions: Partial<ManagerOptions & SocketOptions> = {
+    autoConnect: false,
+    ...options.socketOptions,
+  };
+  const socketFactory = options.socketFactory ?? defaultSocketFactory;
+  let socket: RuntimeSocketLike | undefined;
+  let listenerAttached = false;
+
+  const handleManagerExecuted = (event: unknown): void => {
+    if (!isRuntimeManagerExecutedEvent(event)) {
+      return;
     }
+
+    const handlers = subscriptions.get(event.topic);
+    if (!handlers) {
+      return;
+    }
+
+    for (const handler of handlers) {
+      handler(event);
+    }
+  };
+
+  return {
+    connect: () => {
+      getSocket().connect();
+    },
+    subscribe: (
+      channel: string,
+      handler: NgxLowcodeWebSocketEventHandler,
+      subscribeOptions?: RuntimeWebSocketSubscribeOptions,
+    ) => {
+      const page = parseRuntimePageTopic(channel);
+      const handlers = subscriptions.get(channel) ?? new Set<NgxLowcodeWebSocketEventHandler>();
+      handlers.add(handler);
+      subscriptions.set(channel, handlers);
+      getSocket().emit('subscribePage', {
+        ...page,
+        ...(subscribeOptions?.afterReplayId
+          ? { afterReplayId: subscribeOptions.afterReplayId }
+          : {}),
+      });
+    },
+    unsubscribe: (channel: string, handler: NgxLowcodeWebSocketEventHandler) => {
+      const handlers = subscriptions.get(channel);
+      handlers?.delete(handler);
+      if (handlers && handlers.size === 0) {
+        subscriptions.delete(channel);
+      }
+    },
+    disconnect: () => {
+      subscriptions.clear();
+      socket?.off('runtimeManagerExecuted', handleManagerExecuted);
+      socket?.disconnect();
+      socket = undefined;
+      listenerAttached = false;
+    },
+  };
+
+  function getSocket(): RuntimeSocketLike {
+    socket ??= socketFactory(socketUrl, socketOptions);
+    if (!listenerAttached) {
+      socket.on('runtimeManagerExecuted', handleManagerExecuted);
+      listenerAttached = true;
+    }
+    return socket;
+  }
+}
+
+export function parseRuntimePageTopic(topic: string): RuntimePageTopicRef {
+  const match = /^tenant\.([^.]+)\.page\.([^.]+)\.instance\.([^.]+)$/.exec(topic);
+  if (!match) {
+    throw new Error(
+      `Invalid runtime page topic: ${topic}. Expected tenant.{tenantId}.page.{pageId}.instance.{pageInstanceId}.`,
+    );
+  }
+  return {
+    tenantId: match[1] ?? '',
+    pageId: match[2] ?? '',
+    pageInstanceId: match[3] ?? '',
   };
 }
 
 function resolveEndpoint(
   options: RuntimeBffAdapterOptions,
   datasource: NgxLowcodeDatasourceDefinition,
-  kind: 'query' | 'mutation'
+  kind: 'query' | 'mutation',
 ): string {
   const configured = String(datasource.request?.url ?? '').trim();
   if (configured) {
@@ -222,7 +368,8 @@ function resolveEndpoint(
   }
 
   const base = resolveBaseUrl(options);
-  const path = kind === 'mutation' ? options.mutationPath ?? '/mutation' : options.queryPath ?? '/query';
+  const path =
+    kind === 'mutation' ? (options.mutationPath ?? '/mutation') : (options.queryPath ?? '/query');
   return `${base}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
@@ -238,7 +385,39 @@ function resolveBaseUrl(options: RuntimeBffAdapterOptions): string {
   return 'http://localhost:6000';
 }
 
-function resolveMutationOperation(datasource: NgxLowcodeDatasourceDefinition): MutationOperation | null {
+function resolveSocketUrl(options: SocketIoWebSocketManagerOptions): string {
+  const baseUrl = resolveBaseUrl({ baseUrl: options.baseUrl });
+  const namespace = options.namespace ?? '/runtime';
+  return `${baseUrl}${namespace.startsWith('/') ? '' : '/'}${namespace}`;
+}
+
+function defaultSocketFactory(
+  url: string,
+  options: Partial<ManagerOptions & SocketOptions>,
+): RuntimeSocketLike {
+  return io(url, options) as Socket;
+}
+
+function isRuntimeManagerExecutedEvent(event: unknown): event is RuntimeManagerExecutedEvent {
+  if (!event || typeof event !== 'object' || Array.isArray(event)) {
+    return false;
+  }
+
+  const candidate = event as Partial<RuntimeManagerExecutedEvent>;
+  return (
+    candidate.type === 'runtime.manager.executed' &&
+    typeof candidate.topic === 'string' &&
+    typeof candidate.patchState === 'object' &&
+    candidate.patchState !== null &&
+    !Array.isArray(candidate.patchState) &&
+    Array.isArray(candidate.refreshedDatasourceIds) &&
+    Array.isArray(candidate.runActionIds)
+  );
+}
+
+function resolveMutationOperation(
+  datasource: NgxLowcodeDatasourceDefinition,
+): MutationOperation | null {
   const configured = datasource.request?.params?.['operation'];
   if (configured === 'create' || configured === 'update' || configured === 'delete') {
     return configured;
@@ -258,7 +437,7 @@ function resolveMutationOperation(datasource: NgxLowcodeDatasourceDefinition): M
 function toQueryPayload(
   datasource: NgxLowcodeDatasourceDefinition,
   state: Record<string, unknown>,
-  options: RuntimeBffAdapterOptions
+  options: RuntimeBffAdapterOptions,
 ): QueryApiRequest {
   const stateKeys = resolveStateKeysConfig(datasource, options);
   const tenantId = String(state[stateKeys.tenantId] ?? 'tenant-a');
@@ -271,7 +450,7 @@ function toQueryPayload(
     tenantId,
     userId,
     roles,
-    limit: 100
+    limit: 100,
   };
 }
 
@@ -279,7 +458,7 @@ function toMutationPayload(
   datasource: NgxLowcodeDatasourceDefinition,
   state: Record<string, unknown>,
   operation: MutationOperation,
-  options: RuntimeBffAdapterOptions
+  options: RuntimeBffAdapterOptions,
 ): MutationApiRequest {
   const stateKeys = resolveStateKeysConfig(datasource, options);
   const tenantId = String(state[stateKeys.tenantId] ?? 'tenant-a');
@@ -289,17 +468,20 @@ function toMutationPayload(
   const keyField = String(datasource.request?.params?.['keyField'] ?? 'id');
   const fieldStateMap = resolveFieldStateMap(datasource);
   const keyValue = String(
-    state[fieldStateMap[keyField] ?? `form_${keyField}`] ?? state[stateKeys.selectedRecordId] ?? ''
+    state[fieldStateMap[keyField] ?? `form_${keyField}`] ?? state[stateKeys.selectedRecordId] ?? '',
   ).trim();
   const orgId = resolveOrgId(datasource, state, tenantId, options);
 
   const data =
     operation === 'delete'
       ? undefined
-      : Object.entries(fieldStateMap).reduce<Record<string, string>>((acc, [fieldName, stateKey]) => {
-          acc[fieldName] = String(state[stateKey] ?? '').trim();
-          return acc;
-        }, {});
+      : Object.entries(fieldStateMap).reduce<Record<string, string>>(
+          (acc, [fieldName, stateKey]) => {
+            acc[fieldName] = String(state[stateKey] ?? '').trim();
+            return acc;
+          },
+          {},
+        );
 
   return {
     table,
@@ -309,18 +491,19 @@ function toMutationPayload(
     roles,
     orgId,
     key: {
-      [keyField]: keyValue
+      [keyField]: keyValue,
     },
-    data
+    data,
   };
 }
 
 function resolveStateKeysConfig(
   datasource: NgxLowcodeDatasourceDefinition,
-  options: RuntimeBffAdapterOptions
+  options: RuntimeBffAdapterOptions,
 ): StateKeysConfig {
   const raw = datasource.request?.params?.['stateKeys'];
-  const normalized = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const normalized =
+    raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const fromState = (key: string): string =>
     (typeof normalized[key] === 'string' && String(normalized[key]).trim()) || '';
 
@@ -328,7 +511,8 @@ function resolveStateKeysConfig(
     tenantId: fromState('tenantId') || options.tenantStateKey?.trim() || 'tenantId',
     userId: fromState('userId') || options.userStateKey?.trim() || 'userId',
     roles: fromState('roles') || options.rolesStateKey?.trim() || 'roles',
-    selectedRecordId: fromState('selectedRecordId') || options.selectedRecordStateKey?.trim() || 'selectedRecordId'
+    selectedRecordId:
+      fromState('selectedRecordId') || options.selectedRecordStateKey?.trim() || 'selectedRecordId',
   };
 }
 
@@ -336,14 +520,17 @@ function resolveOrgId(
   datasource: NgxLowcodeDatasourceDefinition,
   state: Record<string, unknown>,
   tenantId: string,
-  options: RuntimeBffAdapterOptions
+  options: RuntimeBffAdapterOptions,
 ): string {
   const raw = datasource.request?.params?.['orgIdStateKeys'];
   const fromDatasource =
     Array.isArray(raw) && raw.every((item) => typeof item === 'string' && item.trim())
       ? raw.map((item) => item.trim())
       : [];
-  const stateKeys = fromDatasource.length > 0 ? fromDatasource : (options.orgIdStateKeys ?? defaultOrgIdStateKeys());
+  const stateKeys =
+    fromDatasource.length > 0
+      ? fromDatasource
+      : (options.orgIdStateKeys ?? defaultOrgIdStateKeys());
 
   for (const stateKey of stateKeys) {
     const candidate = state[stateKey];
@@ -362,10 +549,13 @@ function defaultOrgIdStateKeys(): string[] {
 function resolveFieldStateMap(datasource: NgxLowcodeDatasourceDefinition): Record<string, string> {
   const raw = datasource.request?.params?.['fieldStateMap'];
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    return Object.entries(raw as Record<string, unknown>).reduce<Record<string, string>>((acc, [field, stateKey]) => {
-      acc[field] = String(stateKey);
-      return acc;
-    }, {});
+    return Object.entries(raw as Record<string, unknown>).reduce<Record<string, string>>(
+      (acc, [field, stateKey]) => {
+        acc[field] = String(stateKey);
+        return acc;
+      },
+      {},
+    );
   }
   return resolveFields(datasource).reduce<Record<string, string>>((acc, field) => {
     acc[field] = `form_${field}`;
@@ -374,7 +564,10 @@ function resolveFieldStateMap(datasource: NgxLowcodeDatasourceDefinition): Recor
 }
 
 function resolveTable(datasource: NgxLowcodeDatasourceDefinition): string {
-  const tableFromParams = typeof datasource.request?.params?.['table'] === 'string' ? datasource.request.params['table'] : '';
+  const tableFromParams =
+    typeof datasource.request?.params?.['table'] === 'string'
+      ? datasource.request.params['table']
+      : '';
   if (tableFromParams.trim()) {
     return tableFromParams.trim();
   }
@@ -395,7 +588,7 @@ function resolveFields(datasource: NgxLowcodeDatasourceDefinition): string[] {
 
 function resolveFilters(
   datasource: NgxLowcodeDatasourceDefinition,
-  state: Record<string, unknown>
+  state: Record<string, unknown>,
 ): Record<string, string | number | boolean> {
   const filters: Record<string, string | number | boolean> = {};
   const prefix = resolveFilterStatePrefix(datasource);
@@ -434,11 +627,15 @@ function resolveFilterStateKeys(datasource: NgxLowcodeDatasourceDefinition): Map
   return new Map(
     Object.entries(raw as Record<string, unknown>)
       .filter(([, value]) => typeof value === 'string' && value.trim())
-      .map(([filterKey, stateKey]) => [filterKey, String(stateKey).trim()])
+      .map(([filterKey, stateKey]) => [filterKey, String(stateKey).trim()]),
   );
 }
 
-function appendFilter(target: Record<string, string | number | boolean>, key: string, value: unknown): void {
+function appendFilter(
+  target: Record<string, string | number | boolean>,
+  key: string,
+  value: unknown,
+): void {
   if (typeof value === 'string') {
     const normalized = value.trim();
     if (!normalized || normalized === 'all') {
@@ -504,7 +701,7 @@ function asObject<T>(value: unknown): T {
 
 function recordExecution(
   options: RuntimeBffAdapterOptions,
-  snapshot: Omit<RuntimeBffExecutionSnapshot, never>
+  snapshot: Omit<RuntimeBffExecutionSnapshot, never>,
 ): void {
   options.onExecution?.(snapshot);
 }
