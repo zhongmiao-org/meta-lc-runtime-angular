@@ -269,6 +269,8 @@ export function createSocketIoWebSocketManager(
   options: SocketIoWebSocketManagerOptions = {},
 ): NgxLowcodeWebSocketManager {
   const subscriptions = new Map<string, Set<NgxLowcodeWebSocketEventHandler>>();
+  const originalReplayIdsByTopic = new Map<string, string>();
+  const latestReplayIdsByTopic = new Map<string, string>();
   const socketUrl = resolveSocketUrl(options);
   const socketOptions: Partial<ManagerOptions & SocketOptions> = {
     autoConnect: false,
@@ -283,6 +285,10 @@ export function createSocketIoWebSocketManager(
       return;
     }
 
+    if (event.replayId) {
+      latestReplayIdsByTopic.set(event.topic, event.replayId);
+    }
+
     const handlers = subscriptions.get(event.topic);
     if (!handlers) {
       return;
@@ -290,6 +296,12 @@ export function createSocketIoWebSocketManager(
 
     for (const handler of handlers) {
       handler(event);
+    }
+  };
+
+  const handleConnect = (): void => {
+    for (const channel of subscriptions.keys()) {
+      emitSubscribePage(channel);
     }
   };
 
@@ -304,25 +316,31 @@ export function createSocketIoWebSocketManager(
     ) => {
       const page = parseRuntimePageTopic(channel);
       const handlers = subscriptions.get(channel) ?? new Set<NgxLowcodeWebSocketEventHandler>();
+      const isFirstTopicHandler = handlers.size === 0;
       handlers.add(handler);
       subscriptions.set(channel, handlers);
-      getSocket().emit('subscribePage', {
-        ...page,
-        ...(subscribeOptions?.afterReplayId
-          ? { afterReplayId: subscribeOptions.afterReplayId }
-          : {}),
-      });
+      if (subscribeOptions?.afterReplayId) {
+        originalReplayIdsByTopic.set(channel, subscribeOptions.afterReplayId);
+      }
+      if (isFirstTopicHandler) {
+        emitSubscribePage(channel, page);
+      }
     },
     unsubscribe: (channel: string, handler: NgxLowcodeWebSocketEventHandler) => {
       const handlers = subscriptions.get(channel);
       handlers?.delete(handler);
       if (handlers && handlers.size === 0) {
         subscriptions.delete(channel);
+        originalReplayIdsByTopic.delete(channel);
+        latestReplayIdsByTopic.delete(channel);
       }
     },
     disconnect: () => {
       subscriptions.clear();
+      originalReplayIdsByTopic.clear();
+      latestReplayIdsByTopic.clear();
       socket?.off('runtimeManagerExecuted', handleManagerExecuted);
+      socket?.off('connect', handleConnect);
       socket?.disconnect();
       socket = undefined;
       listenerAttached = false;
@@ -333,9 +351,18 @@ export function createSocketIoWebSocketManager(
     socket ??= socketFactory(socketUrl, socketOptions);
     if (!listenerAttached) {
       socket.on('runtimeManagerExecuted', handleManagerExecuted);
+      socket.on('connect', handleConnect);
       listenerAttached = true;
     }
     return socket;
+  }
+
+  function emitSubscribePage(channel: string, page = parseRuntimePageTopic(channel)): void {
+    const replayId = latestReplayIdsByTopic.get(channel) ?? originalReplayIdsByTopic.get(channel);
+    getSocket().emit('subscribePage', {
+      ...page,
+      ...(replayId ? { afterReplayId: replayId } : {}),
+    });
   }
 }
 

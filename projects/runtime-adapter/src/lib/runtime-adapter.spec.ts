@@ -207,6 +207,7 @@ describe('createSocketIoWebSocketManager', () => {
     expect(socket.connectCalls).toBe(1);
     expect(socket.disconnectCalls).toBe(1);
     expect(socket.listenerCount('runtimeManagerExecuted')).toBe(0);
+    expect(socket.listenerCount('connect')).toBe(0);
   });
 
   it('subscribes to BFF runtime page topics without cursor', async () => {
@@ -239,6 +240,62 @@ describe('createSocketIoWebSocketManager', () => {
     ]);
   });
 
+  it('resubscribes active topics after socket reconnect', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+    const topic = 'tenant.tenant-a.page.orders.instance.instance-1';
+
+    await manager.connect();
+    await manager.subscribe(topic, vi.fn());
+    socket.receive('connect', undefined);
+
+    expect(socket.emits).toEqual([
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+        },
+      },
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+        },
+      },
+    ]);
+  });
+
+  it('resubscribes a topic once when multiple handlers share it', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+    const topic = 'tenant.tenant-a.page.orders.instance.instance-1';
+
+    await manager.connect();
+    await manager.subscribe(topic, vi.fn());
+    await manager.subscribe(topic, vi.fn());
+    socket.emits.length = 0;
+    socket.receive('connect', undefined);
+
+    expect(socket.emits).toEqual([
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+        },
+      },
+    ]);
+  });
+
   it('subscribes with replay cursor options', async () => {
     const socket = new FakeRuntimeSocket();
     const manager = createSocketIoWebSocketManager({
@@ -255,6 +312,76 @@ describe('createSocketIoWebSocketManager', () => {
         afterReplayId: '42-0',
       },
     );
+
+    expect(socket.emits).toEqual([
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+          afterReplayId: '42-0',
+        },
+      },
+    ]);
+  });
+
+  it('uses the latest replay cursor when resubscribing after reconnect', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+    const topic = 'tenant.tenant-a.page.orders.instance.instance-1';
+    const handler = vi.fn();
+
+    await subscribeWithOptions(manager, topic, handler, {
+      afterReplayId: '42-0',
+    });
+    socket.receive('runtimeManagerExecuted', {
+      type: 'runtime.manager.executed',
+      topic,
+      page: {
+        tenantId: 'tenant-a',
+        pageId: 'orders',
+        pageInstanceId: 'instance-1',
+      },
+      replayId: '43-0',
+      patchState: {},
+      refreshedDatasourceIds: [],
+      runActionIds: [],
+    });
+    socket.emits.length = 0;
+    socket.receive('connect', undefined);
+
+    expect(socket.emits).toEqual([
+      {
+        event: 'subscribePage',
+        payload: {
+          tenantId: 'tenant-a',
+          pageId: 'orders',
+          pageInstanceId: 'instance-1',
+          afterReplayId: '43-0',
+        },
+      },
+    ]);
+  });
+
+  it('falls back to the original replay cursor when no newer event was received', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+
+    await subscribeWithOptions(
+      manager,
+      'tenant.tenant-a.page.orders.instance.instance-1',
+      vi.fn(),
+      {
+        afterReplayId: '42-0',
+      },
+    );
+    socket.emits.length = 0;
+    socket.receive('connect', undefined);
 
     expect(socket.emits).toEqual([
       {
@@ -309,6 +436,8 @@ describe('createSocketIoWebSocketManager', () => {
     await manager.connect();
     await manager.subscribe(topic, handler);
     await manager.unsubscribe(topic, handler);
+    socket.emits.length = 0;
+    socket.receive('connect', undefined);
     socket.receive('runtimeManagerExecuted', {
       type: 'runtime.manager.executed',
       topic,
@@ -323,6 +452,26 @@ describe('createSocketIoWebSocketManager', () => {
     });
 
     expect(handler).not.toHaveBeenCalled();
+    expect(socket.emits).toEqual([]);
+  });
+
+  it('clears subscriptions and replay cursors on disconnect', async () => {
+    const socket = new FakeRuntimeSocket();
+    const manager = createSocketIoWebSocketManager({
+      socketFactory: () => socket,
+    });
+    const topic = 'tenant.tenant-a.page.orders.instance.instance-1';
+
+    await subscribeWithOptions(manager, topic, vi.fn(), {
+      afterReplayId: '42-0',
+    });
+    await manager.disconnect();
+    socket.emits.length = 0;
+    socket.receive('connect', undefined);
+
+    expect(socket.emits).toEqual([]);
+    expect(socket.listenerCount('runtimeManagerExecuted')).toBe(0);
+    expect(socket.listenerCount('connect')).toBe(0);
   });
 });
 
