@@ -2,7 +2,10 @@
 
 [English](./CHANGELOG.md) | 中文
 
+
 ## [Unreleased]
+
+## 0.2.1 (2026-04-21)
 
 - fix(runtime): 将 ngx-lowcode core-types peer 范围对齐到 0.2 runtime 包版本线。
 

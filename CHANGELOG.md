@@ -2,7 +2,10 @@
 
 English | [中文](./CHANGELOG.zh-CN.md)
 
+
 ## [Unreleased]
+
+## 0.2.1 (2026-04-21)
 
 - fix(runtime): align the ngx-lowcode core-types peer range with the 0.2 runtime package line.
 
