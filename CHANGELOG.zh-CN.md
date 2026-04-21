@@ -2,8 +2,9 @@
 
 [English](./CHANGELOG.md) | 中文
 
-
 ## [Unreleased]
+
+- fix(ci): release finalize PR 创建前先格式化归档后的 changelog 文件。
 
 ## 0.2.1 (2026-04-21)
 
