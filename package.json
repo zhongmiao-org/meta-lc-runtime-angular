@@ -6,7 +6,11 @@
     "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
-    "test": "ng test"
+    "test": "ng test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "npm run format:check",
+    "release:draft-notes": "bash .github/scripts/extract_unreleased.sh CHANGELOG.md"
   },
   "private": true,
   "packageManager": "npm@11.4.2",
