@@ -2,8 +2,9 @@
 
 English | [中文](./CHANGELOG.zh-CN.md)
 
-
 ## [Unreleased]
+
+- fix(ci): format archived changelog files before opening release finalize PRs.
 
 ## 0.2.1 (2026-04-21)
 

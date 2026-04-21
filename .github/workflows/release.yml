@@ -187,6 +187,7 @@ jobs:
 
           bash .github/scripts/finalize_changelog.sh "${{ steps.meta.outputs.version }}" "${BODY_FILE}" CHANGELOG.md
           bash .github/scripts/finalize_changelog.sh "${{ steps.meta.outputs.version }}" "" CHANGELOG.zh-CN.md
+          npx prettier --write CHANGELOG.md CHANGELOG.zh-CN.md
 
           if git diff --quiet -- ${CHANGELOG_FILES}; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
