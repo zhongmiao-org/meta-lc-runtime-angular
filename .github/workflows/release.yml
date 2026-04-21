@@ -1,47 +1,57 @@
-name: Publish Runtime Adapter
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
       dist_tag:
-        description: "npm dist-tag"
+        description: npm dist-tag
         required: true
-        default: "latest"
+        default: latest
         type: choice
         options:
           - latest
           - next
+  release:
+    types:
+      - published
+      - prereleased
 
 permissions:
   contents: write
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 concurrency:
-  group: runtime-angular-release
+  group: runtime-angular-release-${{ github.event.release.tag_name || github.ref }}
   cancel-in-progress: false
 
 jobs:
   publish:
+    name: Publish runtime adapter
     runs-on: ubuntu-latest
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - name: Checkout
+      - name: Checkout release source
         uses: actions/checkout@v5
         with:
-          ref: main
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || 'main' }}
+          fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v5
         with:
-          node-version: "24"
+          node-version: 24.3.0
+          registry-url: https://registry.npmjs.org
           cache: npm
+
+      - name: Pin npm version
+        run: npm i -g npm@11.4.2
 
       - name: Install dependencies
         run: npm ci
-
-      - name: Build package
-        run: npm run build
 
       - name: Resolve package metadata
         id: meta
@@ -49,9 +59,40 @@ jobs:
           NAME="$(node -p "require('./projects/runtime-adapter/package.json').name")"
           VERSION="$(node -p "require('./projects/runtime-adapter/package.json').version")"
           TAG="v${VERSION}"
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            git fetch origin main
+            TAG_COMMIT="$(git rev-list -n 1 "${RELEASE_TAG}")"
+
+            if ! git merge-base --is-ancestor "${TAG_COMMIT}" origin/main; then
+              echo "Release tag ${RELEASE_TAG} does not point to a commit on main."
+              exit 1
+            fi
+
+            if [[ "${RELEASE_TAG}" != "${TAG}" ]]; then
+              echo "Tag/version mismatch: release tag=${RELEASE_TAG}, package version=${VERSION}"
+              exit 1
+            fi
+
+            if [[ "${{ github.event.release.prerelease }}" == "true" ]]; then
+              DIST_TAG="next"
+            else
+              DIST_TAG="latest"
+            fi
+          else
+            DIST_TAG="${{ inputs.dist_tag }}"
+          fi
+
+          {
+            echo "name=${NAME}"
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "dist_tag=${DIST_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build package
+        run: npm run build
 
       - name: Ensure version is not already published
         run: |
@@ -72,27 +113,33 @@ jobs:
           EOF
 
       - name: Publish package
-        run: |
-          npm publish ./dist/runtime-adapter --access public --tag "${{ github.event.inputs.dist_tag }}"
+        run: npm publish ./dist/runtime-adapter --access public --tag "${{ steps.meta.outputs.dist_tag }}"
 
-      - name: Upsert GitHub release
+      - name: Upsert GitHub release for manual dispatch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          PACKAGE_NAME: ${{ steps.meta.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.meta.outputs.version }}
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
         with:
           script: |
-            const tag = '${{ steps.meta.outputs.tag }}';
-            const name = '${{ steps.meta.outputs.name }}';
-            const version = '${{ steps.meta.outputs.version }}';
-            const distTag = '${{ github.event.inputs.dist_tag }}';
+            const tag = process.env.RELEASE_TAG;
+            const name = process.env.PACKAGE_NAME;
+            const version = process.env.PACKAGE_VERSION;
+            const distTag = process.env.DIST_TAG;
             const body = [
               `Published ${name}@${version}`,
               '',
               `- npm dist-tag: ${distTag}`,
-              `- package path: dist/runtime-adapter`
+              `- package path: dist/runtime-adapter`,
             ].join('\n');
 
             const releases = await github.paginate(github.rest.repos.listReleases, {
               owner: context.repo.owner,
-              repo: context.repo.repo
+              repo: context.repo.repo,
+              per_page: 100,
             });
             const existing = releases.find((r) => r.tag_name === tag);
 
@@ -104,7 +151,7 @@ jobs:
                 draft: false,
                 prerelease: distTag === 'next',
                 name: tag,
-                body
+                body,
               });
               core.info(`Updated release ${tag}`);
             } else {
@@ -112,11 +159,57 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 tag_name: tag,
-                target_commitish: context.sha,
+                target_commitish: 'main',
                 name: tag,
                 draft: false,
                 prerelease: distTag === 'next',
-                body
+                body,
               });
               core.info(`Created release ${tag}`);
             }
+
+      - name: Checkout main for changelog finalize
+        run: git switch -C main origin/main
+
+      - name: Finalize changelog archives
+        id: changelog
+        env:
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          BRANCH="chore/changelog-${{ steps.meta.outputs.version }}-${GITHUB_RUN_ID}"
+          BODY_FILE=""
+          CHANGELOG_FILES="CHANGELOG.md CHANGELOG.zh-CN.md"
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            BODY_FILE=".release_body.txt"
+            printf '%s\n' "${RELEASE_BODY}" > "${BODY_FILE}"
+          fi
+
+          bash .github/scripts/finalize_changelog.sh "${{ steps.meta.outputs.version }}" "${BODY_FILE}" CHANGELOG.md
+          bash .github/scripts/finalize_changelog.sh "${{ steps.meta.outputs.version }}" "" CHANGELOG.zh-CN.md
+
+          if git diff --quiet -- ${CHANGELOG_FILES}; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${BRANCH}"
+          git add ${CHANGELOG_FILES}
+          git commit -m "chore(changelog): finalize v${{ steps.meta.outputs.version }}"
+          git push --set-upstream origin "${BRANCH}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Create changelog archive PR
+        if: ${{ steps.changelog.outputs.changed == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "chore(changelog): finalize v${{ steps.meta.outputs.version }}" \
+            --body "Automated changelog archive after publishing \`${{ steps.meta.outputs.tag }}\`." \
+            --base main \
+            --head "${{ steps.changelog.outputs.branch }}"

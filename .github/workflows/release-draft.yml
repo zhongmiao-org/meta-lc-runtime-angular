@@ -1,0 +1,130 @@
+name: Release Draft
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+concurrency:
+  group: release-draft-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-release-draft:
+    name: Create or update release draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.3.0
+          cache: npm
+
+      - name: Pin npm version
+        run: npm i -g npm@11.4.2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve release metadata from main
+        id: meta
+        run: |
+          VERSION="$(node -p "require('./projects/runtime-adapter/package.json').version")"
+          TAG="v${VERSION}"
+          if [[ "${VERSION}" =~ -(beta|rc)\.[0-9]+$ ]]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
+          fi
+
+          set +e
+          bash .github/scripts/extract_unreleased.sh CHANGELOG.md .release_notes.txt
+          EXTRACT_EXIT_CODE="$?"
+          set -e
+
+          if [[ "${EXTRACT_EXIT_CODE}" -eq 2 ]]; then
+            echo "Unreleased section is empty, skipping draft upsert."
+            {
+              echo "version=${VERSION}"
+              echo "tag=${TAG}"
+              echo "prerelease=${PRERELEASE}"
+              echo "skipped=true"
+              echo "body="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${EXTRACT_EXIT_CODE}" -ne 0 ]]; then
+            echo "Failed to extract Unreleased notes."
+            exit "${EXTRACT_EXIT_CODE}"
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "prerelease=${PRERELEASE}"
+            echo "skipped=false"
+            echo "body<<EOF_BODY"
+            cat .release_notes.txt
+            echo "EOF_BODY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upsert GitHub release draft
+        if: ${{ steps.meta.outputs.skipped != 'true' }}
+        uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          RELEASE_BODY: ${{ steps.meta.outputs.body }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const version = process.env.RELEASE_VERSION;
+            const body = process.env.RELEASE_BODY || '';
+            const prerelease = process.env.RELEASE_PRERELEASE === 'true';
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+
+            const existing = releases.find((r) => r.tag_name === tag && r.draft);
+            if (existing) {
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existing.id,
+                tag_name: tag,
+                target_commitish: 'main',
+                name: tag,
+                body,
+                draft: true,
+                prerelease,
+              });
+              core.info(`Updated draft release for ${tag} (version ${version}).`);
+            } else {
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                target_commitish: 'main',
+                name: tag,
+                body,
+                draft: true,
+                prerelease,
+              });
+              core.info(`Created draft release for ${tag} (version ${version}).`);
+            }
